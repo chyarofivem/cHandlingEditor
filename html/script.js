@@ -45,6 +45,7 @@
         activeGroupId: null,
         statusTimer: null,
         restarting: false,
+        restartSupported: true,
     };
 
     const groupIconMarkup = `
@@ -192,9 +193,12 @@
         } else if (!state.canEdit) {
             dom.restartButton.disabled = true;
             setGlobalStatus('idle', 'Viewing source values', true);
-        } else {
+        } else if (state.restartSupported) {
             dom.restartButton.disabled = false;
             setGlobalStatus('saved', 'All changes saved', true);
+        } else {
+            dom.restartButton.disabled = true;
+            setGlobalStatus('saved', 'All changes applied live', true);
         }
     }
 
@@ -718,6 +722,7 @@
 
         const vehicle = payload.vehicle && typeof payload.vehicle === 'object' ? payload.vehicle : {};
         const handling = payload.handling && typeof payload.handling === 'object' ? payload.handling : {};
+        state.restartSupported = handling.restartSupported !== false;
         state.vehicleResource = safeText(handling.resource || handling.resourceName, 'unknown resource');
 
         const displayName = safeText(vehicle.displayName || vehicle.label || vehicle.modelName, 'Current vehicle');
@@ -738,7 +743,8 @@
         dom.modeBadgeText.textContent = state.canEdit ? 'Edit access' : 'View-only access';
         dom.permissionCard.hidden = state.canEdit;
         dom.readonlyBanner.hidden = state.canEdit;
-        dom.restartButton.disabled = !state.canEdit;
+        dom.restartButton.hidden = !state.restartSupported;
+        dom.restartButton.disabled = !state.canEdit || !state.restartSupported;
         dom.restartButton.title = state.canEdit ? 'Restart the owning vehicle resource' : 'Edit permission is required';
 
         const groups = Array.isArray(payload.groups) ? payload.groups : [];
