@@ -2354,7 +2354,7 @@ local VANILLA_SCHEMA = {
         'fAttachedMaxDistance', 'fAttachedMaxPenetration' } },
 }
 
-local vanilla = { ready = false, error = nil, store = nil, fields = {}, captureById = {} }
+local vanilla = { ready = false, error = nil, store = nil, fields = {}, captureById = {}, lifecycle = 0 }
 for className, kinds in pairs(VANILLA_SCHEMA) do
     for kind, names in pairs(kinds) do
         local valueType = kind == 'ints' and 'integer' or (kind == 'vectors' and 'vector' or 'number')
@@ -2500,6 +2500,36 @@ local function syncVanilla(target)
     TriggerClientEvent(EVENT_PREFIX .. ':client:vanillaSync', target or -1, {
         revision = vanilla.store.revision, models = vanilla.store.models, fields = vanilla.fields,
     })
+end
+
+local function refreshVanillaAfterResourceStart(resourceName)
+    local cfg = vanillaConfig()
+    if not cfg or resourceName ~= cfg.resource then return end
+
+    -- Resource-start events may run while GetResourceState still reports
+    -- "starting". Defer the read until the data resource is fully mounted;
+    -- otherwise loadVanillaStore fails once and no overrides are rebroadcast.
+    vanilla.lifecycle = vanilla.lifecycle + 1
+    local lifecycle = vanilla.lifecycle
+    CreateThread(function()
+        for _ = 1, 20 do
+            if lifecycle ~= vanilla.lifecycle then return end
+            if GetResourceState(resourceName) == 'started' then
+                if loadVanillaStore() then
+                    syncVanilla(-1)
+                    log(('Reloaded vanilla handling revision %d after %s started.')
+                        :format(vanilla.store.revision, resourceName))
+                else
+                    log(('Vanilla handling reload failed after %s started: %s')
+                        :format(resourceName, tostring(vanilla.error)))
+                end
+                return
+            end
+            Wait(100)
+        end
+        log(('Vanilla handling reload timed out waiting for %s to reach the started state.')
+            :format(resourceName))
+    end)
 end
 
 RegisterNetEvent(EVENT_PREFIX .. ':server:requestVanillaSync', function()
@@ -3086,16 +3116,13 @@ AddEventHandler('playerDropped', function()
 end)
 
 AddEventHandler('onResourceStart', function(resourceName)
-    local cfg = vanillaConfig()
-    if cfg and resourceName == cfg.resource then
-        loadVanillaStore()
-        syncVanilla(-1)
-    end
+    refreshVanillaAfterResourceStart(resourceName)
     if not resourceHasVehicleMetadata(resourceName) then return end
     scheduleIndexScan(500)
 end)
 
 AddEventHandler('onServerResourceStart', function(resourceName)
+    refreshVanillaAfterResourceStart(resourceName)
     local restartAttempt = resourceRestarts[resourceName]
     if not restartAttempt or restartAttempt.phase ~= 'awaiting_start' then return end
 
@@ -3160,6 +3187,7 @@ AddEventHandler('onResourceStop', function(resourceName)
 
     local cfg = vanillaConfig()
     if cfg and resourceName == cfg.resource then
+        vanilla.lifecycle = vanilla.lifecycle + 1
         vanilla.ready, vanilla.store = false, nil
         vanilla.error = ('Storage resource %s stopped.'):format(resourceName)
         TriggerClientEvent(EVENT_PREFIX .. ':client:vanillaSync', -1, {
