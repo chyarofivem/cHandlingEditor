@@ -72,6 +72,7 @@ local activeIndex = {
 }
 
 local pendingInspections = {}
+local pendingVanillaCaptures = {}
 local sessions = {}
 local fileQueues = {}
 local resourceRestarts = {}
@@ -2311,6 +2312,271 @@ local function finishResourceRestart(attempt, ok, message)
     })
 end
 
+-- Runtime handling backend. The schema is server-owned: clients may report values
+-- only for these native-readable fields and never choose a resource or path.
+local VANILLA_SCHEMA = {
+    CHandlingData = {
+        floats = { 'fMass', 'fInitialDragCoeff', 'fDownforceModifier', 'fPercentSubmerged',
+            'fDriveBiasFront', 'fInitialDriveForce', 'fDriveInertia', 'fClutchChangeRateScaleUpShift',
+            'fClutchChangeRateScaleDownShift', 'fInitialDriveMaxFlatVel', 'fBrakeForce',
+            'fBrakeBiasFront', 'fHandBrakeForce', 'fSteeringLock', 'fTractionCurveMax',
+            'fTractionCurveMin', 'fTractionCurveLateral', 'fTractionSpringDeltaMax',
+            'fLowSpeedTractionLossMult', 'fCamberStiffnesss', 'fTractionBiasFront',
+            'fTractionLossMult', 'fSuspensionForce', 'fSuspensionCompDamp',
+            'fSuspensionReboundDamp', 'fSuspensionUpperLimit', 'fSuspensionLowerLimit',
+            'fSuspensionRaise', 'fSuspensionBiasFront', 'fAntiRollBarForce',
+            'fAntiRollBarBiasFront', 'fRollCentreHeightFront', 'fRollCentreHeightRear',
+            'fCollisionDamageMult', 'fWeaponDamageMult', 'fDeformationDamageMult',
+            'fEngineDamageMult', 'fPetrolTankVolume', 'fOilVolume', 'fSeatOffsetDistX',
+            'fSeatOffsetDistY', 'fSeatOffsetDistZ' },
+        ints = { 'nInitialDriveGears', 'nMonetaryValue', 'strModelFlags', 'strHandlingFlags', 'strDamageFlags' },
+        vectors = { 'vecCentreOfMassOffset', 'vecInertiaMultiplier' },
+    },
+    CCarHandlingData = { floats = { 'fBackEndPopUpCarImpulseMult', 'fBackEndPopUpBuildingImpulseMult',
+        'fBackEndPopUpMaxDeltaSpeed', 'fToeFront', 'fToeRear', 'fCamberFront', 'fCamberRear',
+        'fCastor', 'fEngineResistance', 'fMaxDriveBiasTransfer', 'fJumpForceScale' },
+        ints = { 'strAdvancedFlags' } },
+    CBikeHandlingData = { floats = { 'fLeanFwdCOMMult', 'fLeanFwdForceMult', 'fLeanBakCOMMult',
+        'fLeanBakForceMult', 'fMaxBankAngle', 'fFullAnimAngle', 'fDesLeanReturnFrac',
+        'fStickLeanMult', 'fBrakingStabilityMult', 'fInAirSteerMult', 'fWheelieBalancePoint',
+        'fStoppieBalancePoint', 'fWheelieSteerMult', 'fRearBalanceMult', 'fFrontBalanceMult' } },
+    CFlyingHandlingData = { floats = { 'fThrust', 'fThrustFallOff', 'fThrustVectoring', 'fYawMult',
+        'fYawStabilise', 'fSideSlipMult', 'fRollMult', 'fRollStabilise', 'fPitchMult',
+        'fPitchStabilise', 'fFormLiftMult', 'fAttackLiftMult', 'fAttackDiveMult',
+        'fGearDownDragV', 'fGearDownLiftMult', 'fWindMult', 'fMoveRes', 'fTurnRes' },
+        vectors = { 'vecTurnRes', 'vecSpeedRes' } },
+    CBoatHandlingData = { floats = { 'fBoxFrontMult', 'fBoxRearMult', 'fBoxSideMult',
+        'fSampleTop', 'fSampleBottom', 'fAquaplaneForce', 'fAquaplanePushWaterMult',
+        'fAquaplanePushWaterCap', 'fAquaplanePushWaterApply', 'fRudderForce',
+        'fRudderOffsetSubmerge', 'fRudderOffsetForce', 'fWaveAudioMult' } },
+    CTrailerHandlingData = { floats = { 'fAttachLimitPitch', 'fAttachLimitRoll',
+        'fAttachLimitYaw', 'fUprightSpringConstant', 'fUprightDampingConstant',
+        'fAttachedMaxDistance', 'fAttachedMaxPenetration' } },
+}
+
+local vanilla = { ready = false, error = nil, store = nil, fields = {}, captureById = {}, lifecycle = 0 }
+for className, kinds in pairs(VANILLA_SCHEMA) do
+    for kind, names in pairs(kinds) do
+        local valueType = kind == 'ints' and 'integer' or (kind == 'vectors' and 'vector' or 'number')
+        for _, name in ipairs(names) do
+            local id = className .. '.' .. name
+            vanilla.fields[id] = { id = id, class = className, name = name, type = valueType,
+                label = prettyLabel(name), live = true, restartRequired = false }
+        end
+    end
+end
+
+local function vanillaConfig()
+    return type(CHandlingEditorConfig) == 'table' and CHandlingEditorConfig.vanilla or nil
+end
+
+local function validateVanillaStore(raw)
+    local ok, decoded = pcall(json.decode, raw or '')
+    if not ok or type(decoded) ~= 'table' then return nil, 'The vanilla handling JSON is malformed.' end
+    if decoded.schemaVersion ~= 1 or type(decoded.models) ~= 'table' or type(decoded.revision) ~= 'number' then
+        return nil, 'The vanilla handling JSON does not match schema version 1.'
+    end
+    local cfg = vanillaConfig()
+    if decoded.gameBuild ~= cfg.gameBuild then
+        return nil, ('Vanilla handling store build %s does not match configured build %s.')
+            :format(tostring(decoded.gameBuild), tostring(cfg.gameBuild))
+    end
+    if decoded.revision < 0 or decoded.revision % 1 ~= 0 then
+        return nil, 'The vanilla handling store revision is invalid.'
+    end
+    for hashKey, model in pairs(decoded.models) do
+        local hash = normalizeHash(hashKey)
+        if not hash or tostring(hash) ~= tostring(hashKey) or type(model) ~= 'table'
+            or type(model.baseline) ~= 'table' or type(model.overrides) ~= 'table'
+            or type(model.revision) ~= 'number' or model.revision < 0 or model.revision % 1 ~= 0
+        then
+            return nil, ('The vanilla handling model entry %s is invalid.'):format(tostring(hashKey))
+        end
+        for _, values in ipairs({ model.baseline, model.overrides }) do
+            for id, value in pairs(values) do
+                local field = vanilla.fields[id]
+                if not field or validateFieldValue(field, value) == nil then
+                    return nil, ('The vanilla handling field %s in model %s is invalid.')
+                        :format(tostring(id), hashKey)
+                end
+            end
+        end
+    end
+    return decoded
+end
+
+local function loadVanillaStore()
+    vanilla.ready, vanilla.error, vanilla.store = false, nil, nil
+    local cfg = vanillaConfig()
+    if not cfg or cfg.enabled ~= true then vanilla.error = 'The vanilla runtime backend is disabled.' return false end
+    if type(cfg.resource) ~= 'string' or cfg.resource == '' or type(cfg.file) ~= 'string'
+        or not normalizeResourcePath(cfg.file, false) or cfg.file:sub(1, 1) == '/' then
+        vanilla.error = 'The vanilla runtime resource or relative JSON path is invalid.' return false
+    end
+    if GetResourceState(cfg.resource) ~= 'started' then
+        vanilla.error = ('Storage resource %s is not started. Start it before %s.'):format(cfg.resource, RESOURCE_NAME)
+        return false
+    end
+    local enforced = GetConvarInt('sv_enforceGameBuild', 0)
+    if enforced ~= cfg.gameBuild then
+        vanilla.error = ('sv_enforceGameBuild must be %d (currently %d).'):format(cfg.gameBuild, enforced)
+        return false
+    end
+    local store, err = validateVanillaStore(LoadResourceFile(cfg.resource, cfg.file))
+    if not store then vanilla.error = err return false end
+    vanilla.store, vanilla.ready = store, true
+    return true
+end
+
+local function vanillaGroups(capture)
+    local grouped, order = {}, {}
+    for id, value in pairs(capture) do
+        local schema = vanilla.fields[id]
+        if schema then
+            local group = grouped[schema.class]
+            if not group then
+                group = { name = schema.class, label = prettyClassName(schema.class), fields = {} }
+                grouped[schema.class] = group; order[#order + 1] = group
+            end
+            local field = copyValue(schema); field.value = copyValue(value); field.originalValue = copyValue(value)
+            field.currentValue = copyValue(value); group.fields[#group.fields + 1] = field
+        end
+    end
+    table.sort(order, function(a, b) return a.name < b.name end)
+    for _, group in ipairs(order) do table.sort(group.fields, function(a, b) return a.name < b.name end) end
+    return order
+end
+
+local function requestVanillaCapture(playerSource, payload, actualHash)
+    if not vanilla.ready and not loadVanillaStore() then notify(playerSource, vanilla.error, 'error') return end
+    local token = newToken('capture')
+    pendingVanillaCaptures[playerSource] = { token = token, modelHash = actualHash,
+        modelName = safeDisplayText(payload.modelName, ('0x%08X'):format(actualHash)),
+        displayName = safeDisplayText(payload.displayName, payload.modelName), expiresAt = nowSeconds() + REQUEST_TTL_SECONDS }
+    TriggerClientEvent(EVENT_PREFIX .. ':client:captureVanilla', playerSource, {
+        token = token, modelHash = actualHash, schema = VANILLA_SCHEMA,
+    })
+end
+
+RegisterNetEvent(EVENT_PREFIX .. ':server:vanillaCapture', function(payload)
+    local playerSource = source
+    local pending = pendingVanillaCaptures[playerSource]
+    pendingVanillaCaptures[playerSource] = nil
+    if type(payload) ~= 'table' or not pending or payload.token ~= pending.token or pending.expiresAt < nowSeconds() then return end
+    local actualHash = actualDrivenVehicleModel(playerSource)
+    if actualHash ~= pending.modelHash then notify(playerSource, 'The vehicle changed during handling capture.', 'error') return end
+    local captured = {}
+    if type(payload.fields) == 'table' then
+        for id, value in pairs(payload.fields) do
+            local field = vanilla.fields[id]
+            if field then
+                local normalized = validateFieldValue(field, value)
+                if normalized ~= nil then captured[id] = normalized end
+            end
+        end
+    end
+    local count = 0; for _ in pairs(captured) do count = count + 1 end
+    if count == 0 then notify(playerSource, 'This runtime exposed no safely round-trippable handling fields.', 'error') return end
+    local stored = vanilla.store.models[tostring(actualHash)]
+    local effective = copyValue(captured)
+    if stored and type(stored.overrides) == 'table' then
+        for id, value in pairs(stored.overrides) do if vanilla.fields[id] then effective[id] = copyValue(value) end end
+    end
+    local groups = vanillaGroups(effective)
+    local fields = {}; for _, group in ipairs(groups) do for _, field in ipairs(group.fields) do fields[field.id] = field end end
+    local sessionId = newToken('session')
+    sessions[playerSource] = { id = sessionId, backend = 'vanilla_runtime', expiresAt = nowSeconds() + SESSION_TTL_SECONDS,
+        modelHash = actualHash, modelName = pending.modelName, resource = vanillaConfig().resource,
+        handlingPath = vanillaConfig().file, fields = fields, capture = captured,
+        modelRevision = stored and stored.revision or 0 }
+    TriggerClientEvent(EVENT_PREFIX .. ':client:open', playerSource, { sessionId = sessionId,
+        canEdit = canPlayerEdit(playerSource), vehicle = { modelHash = actualHash, modelName = pending.modelName,
+            displayName = pending.displayName }, handling = { name = pending.modelName, resource = vanillaConfig().resource,
+            path = vanillaConfig().file, backend = 'vanilla_runtime', restartSupported = false }, groups = groups })
+end)
+
+local function syncVanilla(target)
+    if not vanilla.ready then return end
+    TriggerClientEvent(EVENT_PREFIX .. ':client:vanillaSync', target or -1, {
+        revision = vanilla.store.revision, models = vanilla.store.models, fields = vanilla.fields,
+    })
+end
+
+local function refreshVanillaAfterResourceStart(resourceName)
+    local cfg = vanillaConfig()
+    if not cfg or resourceName ~= cfg.resource then return end
+
+    -- Resource-start events may run while GetResourceState still reports
+    -- "starting". Defer the read until the data resource is fully mounted;
+    -- otherwise loadVanillaStore fails once and no overrides are rebroadcast.
+    vanilla.lifecycle = vanilla.lifecycle + 1
+    local lifecycle = vanilla.lifecycle
+    CreateThread(function()
+        for _ = 1, 20 do
+            if lifecycle ~= vanilla.lifecycle then return end
+            if GetResourceState(resourceName) == 'started' then
+                if loadVanillaStore() then
+                    syncVanilla(-1)
+                    log(('Reloaded vanilla handling revision %d after %s started.')
+                        :format(vanilla.store.revision, resourceName))
+                else
+                    log(('Vanilla handling reload failed after %s started: %s')
+                        :format(resourceName, tostring(vanilla.error)))
+                end
+                return
+            end
+            Wait(100)
+        end
+        log(('Vanilla handling reload timed out waiting for %s to reach the started state.')
+            :format(resourceName))
+    end)
+end
+
+RegisterNetEvent(EVENT_PREFIX .. ':server:requestVanillaSync', function()
+    if not vanilla.ready then loadVanillaStore() end
+    syncVanilla(source)
+end)
+
+local function saveVanillaField(playerSource, payload, session, field, newValue, expectedValue)
+    local cfg = vanillaConfig()
+    enqueueFileTask(cfg.resource, cfg.file, function()
+        if sessions[playerSource] ~= session or actualDrivenVehicleModel(playerSource) ~= session.modelHash then
+            saveResult(playerSource, payload, false, { error = 'The vanilla session or driver vehicle changed.' }); return
+        end
+        local raw = LoadResourceFile(cfg.resource, cfg.file)
+        local store, loadError = validateVanillaStore(raw)
+        if not store then vanilla.ready = false; vanilla.error = loadError; saveResult(playerSource, payload, false, { error = loadError }); return end
+        local key = tostring(session.modelHash); local model = store.models[key]
+        local current = model and model.overrides and model.overrides[field.id]
+        if current == nil then current = session.capture[field.id] end
+        if not valueEquals(current, expectedValue, field.type) then
+            field.currentValue = copyValue(current)
+            saveResult(playerSource, payload, false, { error = 'This runtime override changed after the editor was opened.',
+                conflict = true, value = copyValue(current), restartRequired = false }); return
+        end
+        if not model then
+            model = { modelName = session.modelName, captureVersion = 1, revision = 0,
+                baseline = copyValue(session.capture), overrides = {} }; store.models[key] = model
+        end
+        model.overrides[field.id] = copyValue(newValue); model.revision = (model.revision or 0) + 1
+        store.revision = store.revision + 1
+        local encoded = json.encode(store)
+        if not SaveResourceFile(cfg.resource, cfg.file .. '.cHandlingEditor.bak', raw, #raw) then
+            saveResult(playerSource, payload, false, { error = permissionSuggestion(cfg.resource) }); return
+        end
+        if not SaveResourceFile(cfg.resource, cfg.file, encoded, #encoded) then
+            saveResult(playerSource, payload, false, { error = permissionSuggestion(cfg.resource) }); return
+        end
+        local confirmed, confirmError = validateVanillaStore(LoadResourceFile(cfg.resource, cfg.file))
+        if not confirmed or confirmed.revision ~= store.revision then
+            saveResult(playerSource, payload, false, { error = confirmError or 'The runtime store write could not be confirmed.' }); return
+        end
+        vanilla.store = confirmed; vanilla.ready = true; field.currentValue = copyValue(newValue)
+        saveResult(playerSource, payload, true, { value = copyValue(newValue), restartRequired = false })
+        syncVanilla(-1)
+    end, function() saveResult(playerSource, payload, false, { error = 'An unexpected runtime-store error interrupted this save.' }) end)
+end
+
 RegisterCommand('handlingeditor', function(playerSource)
     if playerSource == 0 then
         log('/handlingeditor can only be used by an in-game player.')
@@ -2390,6 +2656,12 @@ RegisterNetEvent(EVENT_PREFIX .. ':server:inspectVehicle', function(payload)
 
     local record, recordError = selectModelRecord(actualHash)
     if not record then
+        if #(activeIndex.unresolvedModels[tostring(actualHash)] or {}) == 0
+            and #(activeIndex.models[tostring(actualHash)] or {}) == 0
+        then
+            requestVanillaCapture(playerSource, payload, actualHash)
+            return
+        end
         notify(playerSource, recordError, 'error')
         return
     end
@@ -2530,6 +2802,12 @@ RegisterNetEvent(EVENT_PREFIX .. ':server:saveField', function(payload)
             value = copyValue(field.currentValue),
             restartRequired = not field.live,
         })
+        return
+    end
+
+    if session.backend == 'vanilla_runtime' then
+        session.expiresAt = nowSeconds() + SESSION_TTL_SECONDS
+        saveVanillaField(playerSource, payload, session, field, newValue, expectedValue)
         return
     end
 
@@ -2690,6 +2968,12 @@ RegisterNetEvent(EVENT_PREFIX .. ':server:restartResource', function(payload)
         restartResult(playerSource, payload, false, { error = 'The editor session expired. Reopen it and try again.' })
         return
     end
+    if session.backend == 'vanilla_runtime' then
+        restartResult(playerSource, payload, false, {
+            error = 'Runtime handling overrides are applied live and cannot restart a resource.',
+        })
+        return
+    end
     if not modelRecordStillMapped(session) then
         restartResult(playerSource, payload, false, {
             error = 'The vehicle resource mapping changed. Reopen the editor before restarting it.',
@@ -2832,11 +3116,13 @@ AddEventHandler('playerDropped', function()
 end)
 
 AddEventHandler('onResourceStart', function(resourceName)
+    refreshVanillaAfterResourceStart(resourceName)
     if not resourceHasVehicleMetadata(resourceName) then return end
     scheduleIndexScan(500)
 end)
 
 AddEventHandler('onServerResourceStart', function(resourceName)
+    refreshVanillaAfterResourceStart(resourceName)
     local restartAttempt = resourceRestarts[resourceName]
     if not restartAttempt or restartAttempt.phase ~= 'awaiting_start' then return end
 
@@ -2899,6 +3185,16 @@ AddEventHandler('onResourceStop', function(resourceName)
         return
     end
 
+    local cfg = vanillaConfig()
+    if cfg and resourceName == cfg.resource then
+        vanilla.lifecycle = vanilla.lifecycle + 1
+        vanilla.ready, vanilla.store = false, nil
+        vanilla.error = ('Storage resource %s stopped.'):format(resourceName)
+        TriggerClientEvent(EVENT_PREFIX .. ':client:vanillaSync', -1, {
+            revision = 0, models = {}, fields = vanilla.fields,
+        })
+    end
+
 
     local restartAttempt = resourceRestarts[resourceName]
     if restartAttempt then
@@ -2937,6 +3233,9 @@ CreateThread(function()
             if pending.expiresAt < currentTime then
                 pendingInspections[playerSource] = nil
             end
+        end
+        for playerSource, pending in pairs(pendingVanillaCaptures) do
+            if pending.expiresAt < currentTime then pendingVanillaCaptures[playerSource] = nil end
         end
         for playerSource, session in pairs(sessions) do
             if session.expiresAt < currentTime then

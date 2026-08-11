@@ -49,6 +49,9 @@ local pendingRestartId = nil
 local activeRestartOverlayId = nil
 local restartFreezeApplied = false
 local restartLoadedModels = {}
+local vanillaOverrides = {}
+local vanillaFields = {}
+local vanillaApplied = {}
 
 local function copyValue(value)
     if type(value) ~= 'table' then
@@ -263,7 +266,6 @@ local function canPreviewField(field)
     local nativeClass = fieldNativeClass(field)
     local valueType = fieldType(field)
     return field.live == true
-        and nativeClass == 'CHandlingData'
         and type(nativeName) == 'string'
         and nativeName ~= ''
         and (valueType == 'number' or valueType == 'integer' or valueType == 'vector')
@@ -456,6 +458,57 @@ RegisterNetEvent(EVENT_PREFIX .. ':client:requestVehicle', function(payload)
     identity.requestId = requestId
     TriggerServerEvent(EVENT_PREFIX .. ':server:inspectVehicle', identity)
 end)
+
+RegisterNetEvent(EVENT_PREFIX .. ':client:captureVanilla', function(payload)
+    if type(payload) ~= 'table' or type(payload.token) ~= 'string' or type(payload.schema) ~= 'table' then return end
+    local vehicle = getDriverVehicle()
+    if not vehicle or not sameHash(GetEntityModel(vehicle), payload.modelHash) then
+        TriggerServerEvent(EVENT_PREFIX .. ':server:vanillaCapture', { token = payload.token, fields = {} })
+        return
+    end
+
+    local captured = {}
+    for className, kinds in pairs(payload.schema) do
+        if type(className) == 'string' and type(kinds) == 'table' then
+            for kind, names in pairs(kinds) do
+                local valueType = kind == 'ints' and 'integer' or (kind == 'vectors' and 'vector' or 'number')
+                if type(names) == 'table' then
+                    for _, name in ipairs(names) do
+                        local field = { class = className, name = name, type = valueType, live = true }
+                        local readOk, value = getLiveValue(vehicle, field)
+                        -- A getter returning a default is not proof that a field exists.
+                        -- Require a harmless same-value setter and matching readback.
+                        if readOk and setLiveValue(vehicle, field, value) then
+                            captured[className .. '.' .. name] = copyValue(value)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    TriggerServerEvent(EVENT_PREFIX .. ':server:vanillaCapture', { token = payload.token, fields = captured })
+end)
+
+RegisterNetEvent(EVENT_PREFIX .. ':client:vanillaSync', function(payload)
+    if type(payload) ~= 'table' or type(payload.models) ~= 'table' or type(payload.fields) ~= 'table' then return end
+    vanillaOverrides = payload.models
+    vanillaFields = payload.fields
+    vanillaApplied = {}
+end)
+
+local function applyVanillaToVehicle(vehicle)
+    if vehicle == 0 or not DoesEntityExist(vehicle) then return end
+    local model = vanillaOverrides[tostring(normalizedHash(GetEntityModel(vehicle)))]
+    if type(model) ~= 'table' or type(model.overrides) ~= 'table' then return end
+    local revision = tonumber(model.revision) or 0
+    if vanillaApplied[vehicle] == revision then return end
+    local succeeded = true
+    for id, value in pairs(model.overrides) do
+        local field = vanillaFields[id]
+        if type(field) ~= 'table' or not setLiveValue(vehicle, field, value) then succeeded = false end
+    end
+    if succeeded then vanillaApplied[vehicle] = revision end
+end
 
 RegisterNetEvent(EVENT_PREFIX .. ':client:open', function(payload)
     if type(payload) ~= 'table' or payload.sessionId == nil then
@@ -995,6 +1048,15 @@ end)
 
 lib.onCache('seat', function(seat)
     if editor.open and seat ~= -1 then closeForVehicleLoss() end
+end)
+
+CreateThread(function()
+    Wait(0)
+    TriggerServerEvent(EVENT_PREFIX .. ':server:requestVanillaSync')
+    while true do
+        for _, vehicle in ipairs(GetGamePool('CVehicle')) do applyVanillaToVehicle(vehicle) end
+        Wait(500)
+    end
 end)
 
 CreateThread(function()
